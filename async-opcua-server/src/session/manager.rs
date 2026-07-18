@@ -15,9 +15,9 @@ use tracing::{error, info};
 
 use crate::{identity_token::IdentityToken, info::ServerInfo};
 use opcua_types::{
-    ActivateSessionRequest, ActivateSessionResponse, CloseSessionRequest, CloseSessionResponse,
-    CreateSessionRequest, CreateSessionResponse, Error, NodeId, ResponseHeader, SignatureData,
-    StatusCode,
+    ActivateSessionRequest, ActivateSessionResponse, ByteString, CloseSessionRequest,
+    CloseSessionResponse, CreateSessionRequest, CreateSessionResponse, Error, NodeId,
+    ResponseHeader, SignatureData, StatusCode,
 };
 
 use super::{instance::Session, message_handler::MessageHandler};
@@ -300,6 +300,13 @@ pub(crate) async fn close_session(
     })
 }
 
+/// Whether `session`'s current nonce still matches `expected` -- i.e. whether it's safe to commit
+/// an activation that was authenticated against `expected` some time ago (across an `.await`
+/// where no lock was held on `session`). See `activate_session`'s own use of this.
+fn nonce_still_current(session: &Session, expected: &ByteString) -> bool {
+    session.session_nonce() == expected
+}
+
 pub(crate) async fn activate_session(
     mgr_lck: &RwLock<SessionManager>,
     channel: &mut SecureChannel,
@@ -367,6 +374,16 @@ pub(crate) async fn activate_session(
             //  token
         }
 
+        // The session nonce was snapshotted above under a read lock, then `authenticate_endpoint`
+        // awaited with no lock held. If a second, concurrent ActivateSession for the same session
+        // completed in that window, it rotated the nonce (see `Session::activate`'s
+        // `server_nonce`/`session_nonce` update) -- committing this activation anyway would let a
+        // stale, already-superseded nonce activate, weakening the replay/freshness guarantee the
+        // nonce exists to provide. Re-check under the same write lock that commits the activation.
+        if !nonce_still_current(&session, &session_nonce) {
+            return Err(StatusCode::BadNonceInvalid);
+        }
+
         // TODO: If the user identity changed here, we need to re-check permissions for any created monitored items.
         // It may be possible to just create a "fake" UserAccessLevel for each monitored item and pass it to the auth manager.
         // The standard also mentions that a server may need to
@@ -398,4 +415,65 @@ pub(crate) async fn activate_session(
         results: None,
         diagnostic_infos: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use opcua_crypto::random;
+    use opcua_types::{ApplicationDescription, MessageSecurityMode, NodeId, UAString};
+
+    use crate::{authenticator::UserToken, identity_token::IdentityToken, ServerBuilder};
+
+    use super::{nonce_still_current, Session};
+
+    /// `nonce_still_current` is what `activate_session` re-checks under the write lock that
+    /// commits an activation, guarding against a stale nonce (captured before an intervening
+    /// `.await`) committing after a concurrent activation has already rotated it. This test
+    /// exercises that check directly, in isolation from the concurrency it protects against.
+    #[tokio::test]
+    async fn nonce_still_current_detects_rotation() {
+        let (_server, handle) = ServerBuilder::new_anonymous("nonce check test")
+            .without_node_managers()
+            .build()
+            .expect("test server should build");
+        let info = handle.info();
+
+        let initial_nonce = random::byte_string(32);
+        let mut session = Session::create(
+            info,
+            NodeId::new(0, 1),
+            1,
+            60_000,
+            0,
+            0,
+            UAString::from("opc.tcp://localhost"),
+            "http://opcfoundation.org/UA/SecurityPolicy#None".to_string(),
+            IdentityToken::None,
+            None,
+            initial_nonce.clone(),
+            UAString::from("nonce-check-test"),
+            ApplicationDescription::default(),
+            MessageSecurityMode::None,
+        );
+
+        assert!(nonce_still_current(&session, &initial_nonce));
+
+        // Simulates a concurrent, intervening ActivateSession completing and rotating the
+        // nonce while this activation's own authentication step was in flight.
+        let rotated_nonce = random::byte_string(32);
+        assert_ne!(initial_nonce, rotated_nonce);
+        session.activate(
+            1,
+            rotated_nonce.clone(),
+            IdentityToken::None,
+            None,
+            UserToken("someone-else".to_string()),
+        );
+
+        assert!(
+            !nonce_still_current(&session, &initial_nonce),
+            "a rotated nonce must not still compare equal to the stale, pre-rotation snapshot"
+        );
+        assert!(nonce_still_current(&session, &rotated_nonce));
+    }
 }
