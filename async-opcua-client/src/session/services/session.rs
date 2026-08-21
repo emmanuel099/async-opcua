@@ -204,7 +204,7 @@ impl UARequest for CreateSession<'_> {
             builder_debug!(self, "create_session, success");
             process_service_result(&response.response_header)?;
 
-            if security_policy != SecurityPolicy::None {
+            let server_certificate = if security_policy != SecurityPolicy::None {
                 if self.endpoint.server_certificate != response.server_certificate {
                     error!("Server certificate in CreateSession response does not match channel certificate");
                     return Err(Error::new(StatusCode::BadCertificateInvalid, "Server certificate in CreateSession response does not match channel certificate"));
@@ -252,7 +252,11 @@ impl UARequest for CreateSession<'_> {
                 .inspect_err(|e| {
                     error!("Failed to verify server signature in create session response: {e}");
                 })?;
-            }
+
+                Some(server_certificate)
+            } else {
+                None
+            };
 
             tracing::debug!(
                 "Successfully created session, session_id = {}, max_request_message_size = {}, revised_session_timeout = {}",
@@ -264,7 +268,7 @@ impl UARequest for CreateSession<'_> {
             channel
                 .update_from_created_session(
                     &response.server_nonce,
-                    &response.server_certificate,
+                    server_certificate,
                     &response.authentication_token,
                 )
                 .inspect_err(|e| {

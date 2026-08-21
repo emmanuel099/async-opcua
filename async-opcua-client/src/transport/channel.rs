@@ -81,12 +81,12 @@ impl AsyncSecureChannel {
     pub(crate) fn update_from_created_session(
         &self,
         nonce: &ByteString,
-        certificate: &ByteString,
+        certificate: Option<X509>,
         auth_token: &NodeId,
     ) -> Result<(), Error> {
         let mut secure_channel = trace_write_lock!(self.secure_channel);
         secure_channel.set_remote_nonce_from_byte_string(nonce)?;
-        secure_channel.set_remote_cert_from_byte_string(certificate)?;
+        secure_channel.set_remote_cert(certificate);
         self.set_auth_token(auth_token.clone());
         Ok(())
     }
